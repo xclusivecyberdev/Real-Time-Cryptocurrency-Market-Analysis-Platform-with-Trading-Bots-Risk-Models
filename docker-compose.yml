@@ -1,0 +1,213 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with TimescaleDB extension
+  postgres:
+    image: timescale/timescaledb:latest-pg14
+    container_name: crypto_postgres
+    environment:
+      POSTGRES_DB: crypto_platform
+      POSTGRES_USER: crypto_user
+      POSTGRES_PASSWORD: crypto_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crypto_user -d crypto_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crypto_network
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: crypto_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crypto_network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    container_name: crypto_backend
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - crypto_network
+
+  # Celery Worker for background tasks
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    container_name: crypto_celery_worker
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - postgres
+    command: celery -A tasks.celery_app worker --loglevel=info --concurrency=4
+    networks:
+      - crypto_network
+
+  # Celery Beat for scheduled tasks
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    container_name: crypto_celery_beat
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+      - postgres
+    command: celery -A tasks.celery_app beat --loglevel=info
+    networks:
+      - crypto_network
+
+  # Flower for Celery monitoring
+  flower:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/Dockerfile.backend
+    container_name: crypto_flower
+    env_file:
+      - .env
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    command: celery -A tasks.celery_app flower --port=5555
+    networks:
+      - crypto_network
+
+  # ML Service
+  ml_service:
+    build:
+      context: ./ml
+      dockerfile: ../infrastructure/docker/Dockerfile.ml
+    container_name: crypto_ml
+    env_file:
+      - .env
+    volumes:
+      - ./ml:/app
+      - ml_models:/app/models/saved
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8001:8001"
+    command: python api.py
+    networks:
+      - crypto_network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+    container_name: crypto_frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - crypto_network
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: crypto_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - crypto_network
+
+  # Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: crypto_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - crypto_network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: crypto_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./infrastructure/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - crypto_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  ml_models:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  crypto_network:
+    driver: bridge
